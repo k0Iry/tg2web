@@ -37,7 +37,7 @@ jobs:
           appSourcePath: ${{ github.workspace }}
           _dockerfilePathKey_: _dockerfilePath_
           _targetLabelKey_: _targetLabel_
-          registryUrl: 
+          registryUrl: tg2webacr2026.azurecr.io
           registryUsername: ${{ secrets.TG2WEB_REGISTRY_USERNAME }}
           registryPassword: ${{ secrets.TG2WEB_REGISTRY_PASSWORD }}
           containerAppName: tg2web
