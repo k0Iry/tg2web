@@ -42,7 +42,7 @@ jobs:
           registryPassword: ${{ secrets.TG2WEB_REGISTRY_PASSWORD }}
           containerAppName: tg2web
           resourceGroup: tg2web
-          imageToBuild: default/[parameters('containerAppName')]:${{ github.sha }}
+          imageToBuild: tg2webacr2026.azurecr.io/tg2web:${{ github.sha }}
           _buildArgumentsKey_: |
             _buildArgumentsValues_
 
