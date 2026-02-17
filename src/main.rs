@@ -9,7 +9,7 @@ use azservicebus::core::BasicRetryPolicy;
 use azservicebus::prelude::*;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 use tower_http::{
     cors::{Any, CorsLayer},
@@ -23,88 +23,89 @@ struct AppState {
     sb: Arc<SbState>,
 }
 
-/// 把 client + sender 放在同一个锁里，避免死锁 & 允许 create_sender(&mut self)
+/// ✅ 连接不稳定时，最硬兜底：失败就丢连接并重建
 struct SbState {
     topic: String,
     inner: Mutex<SbInner>,
 }
 
 struct SbInner {
-    client: ServiceBusClient<BasicRetryPolicy>,
+    conn: String,
+    client: Option<ServiceBusClient<BasicRetryPolicy>>,
     sender: Option<ServiceBusSender>,
 }
 
 impl SbState {
-    async fn ensure_sender_locked(inner: &mut SbInner, topic: &str) -> anyhow::Result<()> {
-        if inner.sender.is_none() {
-            let s = inner
-                .client
-                .create_sender(topic.to_string(), ServiceBusSenderOptions::default())
-                .await?;
-            inner.sender = Some(s);
-        }
+    async fn connect_locked(inner: &mut SbInner, topic: &str) -> anyhow::Result<()> {
+        let mut client: ServiceBusClient<BasicRetryPolicy> =
+            ServiceBusClient::new_from_connection_string(
+                inner.conn.clone(),
+                ServiceBusClientOptions::default(),
+            )
+            .await?;
+
+        let sender = client
+            .create_sender(topic.to_string(), ServiceBusSenderOptions::default())
+            .await?;
+
+        inner.client = Some(client);
+        inner.sender = Some(sender);
         Ok(())
     }
 
-    /// 发送：失败则重建 sender 并重试一次（重试时重新构造 message，避免 message 不可复用）
-    async fn publish_bytes_with_retry(
+    async fn force_reconnect(&self) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock().await;
+        inner.client = None;
+        inner.sender = None;
+        Self::connect_locked(&mut inner, &self.topic).await
+    }
+
+    async fn send_once(&self, body: Vec<u8>, message_id: &str) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock().await;
+
+        if inner.client.is_none() || inner.sender.is_none() {
+            Self::connect_locked(&mut inner, &self.topic).await?;
+        }
+
+        let mut msg = ServiceBusMessage::new(body);
+        msg.set_message_id(message_id.to_string())?;
+
+        inner
+            .sender
+            .as_mut()
+            .expect("sender exists after connect")
+            .send_message(msg)
+            .await?;
+
+        Ok(())
+    }
+
+    /// ✅ 最硬兜底：最多 4 次尝试（3 次退避 + 最后一次）
+    pub async fn publish_bytes_with_retry(
         &self,
         body: Vec<u8>,
         message_id: String,
     ) -> anyhow::Result<()> {
-        // --- first attempt ---
-        {
-            let mut inner = self.inner.lock().await;
+        let backoff_ms = [100u64, 500u64, 1000u64];
 
-            Self::ensure_sender_locked(&mut inner, &self.topic).await?;
-
-            let mut msg1 = ServiceBusMessage::new(body.clone());
-            msg1.set_message_id(message_id.clone())?;
-
-            let send1 = inner
-                .sender
-                .as_mut()
-                .expect("sender exists after ensure_sender")
-                .send_message(msg1)
-                .await;
-
-            if send1.is_ok() {
-                return Ok(());
+        for (i, ms) in backoff_ms.iter().enumerate() {
+            let attempt_body = body.clone();
+            match self.send_once(attempt_body, &message_id).await {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    warn!(
+                        "service bus publish attempt {} failed: {:?}; forcing reconnect then retry",
+                        i + 1,
+                        e
+                    );
+                    let _ = self.force_reconnect().await;
+                    tokio::time::sleep(Duration::from_millis(*ms)).await;
+                }
             }
-
-            warn!(
-                "service bus send failed (likely idle detach), will rebuild sender then retry: {:?}",
-                send1.err().unwrap()
-            );
-
-            // 标记 sender 失效，释放锁后重建再试
-            inner.sender = None;
         }
 
-        // --- rebuild + second attempt ---
-        {
-            let mut inner = self.inner.lock().await;
-
-            // 重建 sender
-            let s = inner
-                .client
-                .create_sender(self.topic.clone(), ServiceBusSenderOptions::default())
-                .await?;
-            inner.sender = Some(s);
-
-            // 重试：重新构造 message2
-            let mut msg2 = ServiceBusMessage::new(body);
-            msg2.set_message_id(message_id)?;
-
-            inner
-                .sender
-                .as_mut()
-                .expect("sender exists after rebuild")
-                .send_message(msg2)
-                .await?;
-        }
-
-        Ok(())
+        // 最后一次（不 sleep）
+        self.send_once(body, &message_id).await
     }
 }
 
@@ -159,7 +160,8 @@ struct TgChat {
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "info,azservicebus=warn".to_string()),
+            std::env::var("RUST_LOG")
+                .unwrap_or_else(|_| "info,azservicebus=warn,tower_http=info".to_string()),
         )
         .init();
 
@@ -169,16 +171,12 @@ async fn main() {
         .expect("missing SERVICEBUS_CONNECTION_STRING");
     let topic = std::env::var("SERVICEBUS_TOPIC").unwrap_or_else(|_| "posts".to_string());
 
-    let client: ServiceBusClient<BasicRetryPolicy> =
-        ServiceBusClient::new_from_connection_string(conn, ServiceBusClientOptions::default())
-            .await
-            .expect("failed to create ServiceBusClient");
-
     let sb = Arc::new(SbState {
         topic: topic.clone(),
         inner: Mutex::new(SbInner {
-            client,
-            sender: None, // lazy create
+            conn,
+            client: None,
+            sender: None,
         }),
     });
 
@@ -196,7 +194,12 @@ async fn main() {
         )
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 80));
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8080);
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!("webhook listening on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
@@ -212,6 +215,7 @@ async fn telegram_webhook(
     headers: HeaderMap,
     Json(update): Json<TgUpdate>,
 ) -> impl IntoResponse {
+    // 1) secret token 校验（可选）
     if let Some(expected) = state.secret_token.as_deref() {
         let got = headers
             .get("x-telegram-bot-api-secret-token")
@@ -222,17 +226,20 @@ async fn telegram_webhook(
         }
     }
 
+    // 2) 取 message：优先 channel_post，其次 edited_channel_post
     let (msg, edited) = match (update.channel_post, update.edited_channel_post) {
         (Some(m), _) => (m, false),
         (None, Some(m)) => (m, true),
         (None, None) => return (StatusCode::OK, "ignored").into_response(),
     };
 
+    // 3) text/caption
     let text = msg.text.or(msg.caption).unwrap_or_default();
     if text.trim().is_empty() {
         return (StatusCode::OK, "empty").into_response();
     }
 
+    // 4) tags
     let tags = extract_tags(&text);
 
     let post = Post {
@@ -257,12 +264,14 @@ async fn telegram_webhook(
         }
     };
 
+    // 5) publish to Service Bus（失败重连+重试）
     if let Err(e) = state
         .sb
         .publish_bytes_with_retry(body, ev.post.id.clone())
         .await
     {
         warn!("failed to publish to service bus: {:?}", e);
+        // 返回 500 让 Telegram 重试（至少一次投递）
         return (StatusCode::INTERNAL_SERVER_ERROR, "publish_failed").into_response();
     }
 
