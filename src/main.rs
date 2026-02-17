@@ -230,7 +230,15 @@ async fn publisher_loop(conn: String, topic: String, mut rx: mpsc::Receiver<Queu
         loop {
             attempt += 1;
 
-            match publish_once(&conn, &topic, item.body.clone(), item.sb_message_id.clone()).await {
+            match publish_once(
+                &conn,
+                &topic,
+                item.body.clone(),
+                item.sb_message_id.clone(),
+                item.chat_id,
+            )
+            .await
+            {
                 Ok(_) => {
                     info!(
                         "published ok (attempt={} update_id={} chat_id={} msg_id={})",
@@ -261,6 +269,7 @@ async fn publish_once(
     topic: &str,
     body: Vec<u8>,
     message_id: String,
+    chat_id: i64,
 ) -> anyhow::Result<()> {
     let mut client: ServiceBusClient<BasicRetryPolicy> =
         ServiceBusClient::new_from_connection_string(
@@ -275,6 +284,8 @@ async fn publish_once(
 
     let mut msg = ServiceBusMessage::new(body);
     msg.set_message_id(message_id)?;
+    msg.set_session_id(chat_id.to_string())?;
+    msg.set_partition_key(chat_id.to_string())?;
     sender.send_message(msg).await?;
     Ok(())
 }
