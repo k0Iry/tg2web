@@ -1,19 +1,16 @@
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Sse},
+    response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
+use azservicebus::core::BasicRetryPolicy; // ✅ 修复 ServiceBusClient 的泛型
+use azservicebus::prelude::*;
 use chrono::{DateTime, Utc};
-use futures::Stream; // 只用它的 Stream trait
 use serde::{Deserialize, Serialize};
-use std::{collections::VecDeque, net::SocketAddr, sync::Arc, time::Duration};
-use tokio::sync::{broadcast, RwLock};
-use tokio_stream::{
-    wrappers::{BroadcastStream, IntervalStream},
-    StreamExt, // 这一行非常关键：merge 在这里
-};
+use std::{net::SocketAddr, sync::Arc};
+use tokio::sync::Mutex;
 use tower_http::{
     cors::{Any, CorsLayer},
     trace::TraceLayer,
@@ -23,14 +20,16 @@ use tracing::{info, warn};
 #[derive(Clone)]
 struct AppState {
     secret_token: Option<String>,
-    // 内存存储：最新 N 条（MVP）
-    feed: Arc<RwLock<VecDeque<Post>>>,
-    // 实时广播：SSE 使用
-    tx: broadcast::Sender<PostEvent>,
-    max_items: usize,
+    sb: Arc<SbState>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+struct SbState {
+    // ✅ ServiceBusClient 是泛型：ServiceBusClient<RP>
+    _client: ServiceBusClient<BasicRetryPolicy>,
+    sender: Mutex<ServiceBusSender>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Post {
     id: String, // tg:<chat_id>:<message_id>
     chat_id: i64,
@@ -42,9 +41,9 @@ struct Post {
     received_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PostEvent {
-    kind: &'static str, // "new_post" | "edited_post"
+    kind: String, // "new_post" | "edited_post"
     post: Post,
 }
 
@@ -64,7 +63,6 @@ struct TgMessage {
     chat: TgChat,
     #[serde(default)]
     text: Option<String>,
-    // 如果你后面要支持 caption / media，再扩
     #[serde(default)]
     caption: Option<String>,
 }
@@ -81,28 +79,36 @@ struct TgChat {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "info,tower_http=info".to_string()),
-        )
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
         .init();
 
-    let (tx, _rx) = broadcast::channel::<PostEvent>(1024);
+    let secret_token = std::env::var("TELEGRAM_WEBHOOK_SECRET").ok();
 
-    let state = AppState {
-        secret_token: std::env::var("TELEGRAM_WEBHOOK_SECRET").ok(),
-        feed: Arc::new(RwLock::new(VecDeque::new())),
-        tx,
-        max_items: std::env::var("MAX_ITEMS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(500),
-    };
+    let conn = std::env::var("SERVICEBUS_CONNECTION_STRING")
+        .expect("missing SERVICEBUS_CONNECTION_STRING");
+    let topic = std::env::var("SERVICEBUS_TOPIC").unwrap_or_else(|_| "posts".to_string());
+
+    // ✅ 创建并持有 client + sender（一次性）
+    let mut client: ServiceBusClient<BasicRetryPolicy> =
+        ServiceBusClient::new_from_connection_string(conn, ServiceBusClientOptions::default())
+            .await
+            .expect("failed to create ServiceBusClient");
+
+    let sender = client
+        .create_sender(topic, ServiceBusSenderOptions::default())
+        .await
+        .expect("failed to create ServiceBusSender");
+
+    let sb = Arc::new(SbState {
+        _client: client,
+        sender: Mutex::new(sender),
+    });
+
+    let state = AppState { secret_token, sb };
 
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/telegram/webhook", post(telegram_webhook))
-        .route("/api/feed", get(get_feed))
-        .route("/api/stream", get(sse_stream))
         .layer(TraceLayer::new_for_http())
         .layer(
             CorsLayer::new()
@@ -113,7 +119,7 @@ async fn main() {
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 80));
-    info!("listening on http://{}", addr);
+    info!("webhook listening on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
@@ -151,7 +157,6 @@ async fn telegram_webhook(
 
     // 3) 提取文本（text 或 caption）
     let text = msg.text.or(msg.caption).unwrap_or_default();
-    // 过滤空消息（你也可以保留）
     if text.trim().is_empty() {
         return (StatusCode::OK, "empty").into_response();
     }
@@ -170,78 +175,35 @@ async fn telegram_webhook(
         received_at: Utc::now(),
     };
 
-    // 5) 写入内存 feed（MVP），并广播事件（SSE 用）
-    {
-        let mut feed = state.feed.write().await;
+    let kind = if edited { "edited_post" } else { "new_post" }.to_string();
+    let ev = PostEvent { kind, post };
 
-        // 幂等更新：如果已有同 id，则替换
-        if let Some(idx) = feed.iter().position(|p| p.id == post.id) {
-            feed[idx] = post.clone();
-        } else {
-            feed.push_front(post.clone());
-            if feed.len() > state.max_items {
-                feed.pop_back();
-            }
+    // 5) publish 到 Service Bus
+    let body = match serde_json::to_vec(&ev) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("serialize failed: {:?}", e);
+            return (StatusCode::BAD_REQUEST, "bad_payload").into_response();
         }
+    };
+
+    let mut sb_msg = ServiceBusMessage::new(body);
+    if let Err(e) = sb_msg.set_message_id(ev.post.id.clone()) {
+        warn!("failed to set message id: {:?}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, "set_message_id failed").into_response();
+    } // ✅ 正确设置 message_id
+
+    let mut sender = state.sb.sender.lock().await;
+    if let Err(e) = sender.send_message(sb_msg).await {
+        warn!("failed to publish to service bus: {:?}", e);
+        // 返回 500 让 Telegram 重试（更接近至少一次）
+        return (StatusCode::INTERNAL_SERVER_ERROR, "publish_failed").into_response();
     }
 
-    let kind = if edited { "edited_post" } else { "new_post" };
-    let _ = state.tx.send(PostEvent { kind, post });
-
-    // 返回 200，Telegram 就不会重试
     (StatusCode::OK, "ok").into_response()
 }
 
-async fn get_feed(State(state): State<AppState>) -> impl IntoResponse {
-    let feed = state.feed.read().await;
-    let items: Vec<Post> = feed.iter().cloned().collect();
-    Json(serde_json::json!({
-        "items": items,
-        "count": items.len()
-    }))
-}
-
-async fn sse_stream(
-    State(state): State<AppState>,
-) -> Sse<impl Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>> {
-    // 每个连接拿到一个 receiver
-    let rx = state.tx.subscribe();
-
-    // 心跳：避免代理/浏览器断开
-    let heartbeat = IntervalStream::new(tokio::time::interval(Duration::from_secs(15))).map(|_| {
-        Ok(axum::response::sse::Event::default()
-            .event("ping")
-            .data("1"))
-    });
-
-    let events = BroadcastStream::new(rx)
-    .map(|msg| {
-        match msg {
-            Ok(ev) => {
-                let json = serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_string());
-                Ok(axum::response::sse::Event::default()
-                    .event(ev.kind)
-                    .data(json))
-            }
-            Err(_) => {
-                // lagged/closed：发一个轻量事件也行，或者继续发 ping
-                Ok(axum::response::sse::Event::default()
-                    .event("lagged")
-                    .data("1"))
-            }
-        }
-    });
-
-    Sse::new(heartbeat.merge(events)).keep_alive(
-        axum::response::sse::KeepAlive::new()
-            .interval(Duration::from_secs(20))
-            .text("keepalive"),
-    )
-}
-
 fn extract_tags(text: &str) -> Vec<String> {
-    // 简单版：匹配 #xxx，允许字母数字下划线
-    // 你后面可以升级：支持中文 tag、去重、大小写归一等
     let mut tags = Vec::new();
     for token in text.split_whitespace() {
         if let Some(stripped) = token.strip_prefix('#') {

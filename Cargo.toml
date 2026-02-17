@@ -14,3 +14,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
+anyhow = "1.0"
+azservicebus = "0.25"
