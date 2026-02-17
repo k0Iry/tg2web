@@ -9,8 +9,8 @@ use azservicebus::core::BasicRetryPolicy;
 use azservicebus::prelude::*;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, sync::Arc};
-use tokio::sync::Mutex;
+use std::{net::SocketAddr, time::Duration};
+use tokio::sync::mpsc;
 use tower_http::{
     cors::{Any, CorsLayer},
     trace::TraceLayer,
@@ -20,80 +20,20 @@ use tracing::{info, warn};
 #[derive(Clone)]
 struct AppState {
     secret_token: Option<String>,
-    sb: Arc<SbState>,
+    tx: mpsc::Sender<QueuedEvent>,
 }
 
-struct SbState {
-    topic: String,
-    inner: Mutex<SbInner>,
+#[derive(Debug, Clone)]
+struct QueuedEvent {
+    body: Vec<u8>,
+    sb_message_id: String,
+    // 用来打日志定位
+    update_id: i64,
+    chat_id: i64,
+    message_id: i64,
 }
 
-struct SbInner {
-    conn: String,
-    client: Option<ServiceBusClient<BasicRetryPolicy>>,
-}
-
-impl SbState {
-    async fn ensure_client_locked(inner: &mut SbInner) -> anyhow::Result<()> {
-        if inner.client.is_none() {
-            let client: ServiceBusClient<BasicRetryPolicy> =
-                ServiceBusClient::new_from_connection_string(
-                    inner.conn.clone(),
-                    ServiceBusClientOptions::default(),
-                )
-                .await?;
-            inner.client = Some(client);
-        }
-        Ok(())
-    }
-
-    async fn rebuild_client_locked(inner: &mut SbInner) -> anyhow::Result<()> {
-        let client: ServiceBusClient<BasicRetryPolicy> =
-            ServiceBusClient::new_from_connection_string(
-                inner.conn.clone(),
-                ServiceBusClientOptions::default(),
-            )
-            .await?;
-        inner.client = Some(client);
-        Ok(())
-    }
-
-    /// ✅ 不缓存 sender：每次 publish 都创建 sender，用完即 drop，彻底消灭 IdleTimerExpired
-    async fn publish_once(&self, body: Vec<u8>, message_id: String) -> anyhow::Result<()> {
-        let mut inner = self.inner.lock().await;
-        Self::ensure_client_locked(&mut inner).await?;
-
-        let client = inner.client.as_mut().expect("client exists");
-        let mut sender = client
-            .create_sender(self.topic.clone(), ServiceBusSenderOptions::default())
-            .await?;
-
-        let mut msg = ServiceBusMessage::new(body);
-        msg.set_message_id(message_id)?;
-        sender.send_message(msg).await?;
-
-        Ok(())
-    }
-
-    /// ✅ 失败就重建 client 再重试一次（足够稳）
-    pub async fn publish_with_retry(
-        &self,
-        body: Vec<u8>,
-        message_id: String,
-    ) -> anyhow::Result<()> {
-        match self.publish_once(body.clone(), message_id.clone()).await {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                warn!("publish failed, rebuilding client then retry: {:?}", e);
-                let mut inner = self.inner.lock().await;
-                inner.client = None;
-                Self::rebuild_client_locked(&mut inner).await?;
-                drop(inner);
-                self.publish_once(body, message_id).await
-            }
-        }
-    }
-}
+/// --- 业务数据结构（与你现在一致） ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Post {
@@ -156,12 +96,20 @@ async fn main() {
         .expect("missing SERVICEBUS_CONNECTION_STRING");
     let topic = std::env::var("SERVICEBUS_TOPIC").unwrap_or_else(|_| "posts".to_string());
 
-    let sb = Arc::new(SbState {
-        topic,
-        inner: Mutex::new(SbInner { conn, client: None }),
+    // ✅ 有界队列：避免无限吃内存
+    let queue_cap: usize = std::env::var("QUEUE_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000);
+
+    let (tx, rx) = mpsc::channel::<QueuedEvent>(queue_cap);
+
+    // ✅ 启动后台 publisher（慢慢发到 SB）
+    tokio::spawn(async move {
+        publisher_loop(conn, topic, rx).await;
     });
 
-    let state = AppState { secret_token, sb };
+    let state = AppState { secret_token, tx };
 
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -186,11 +134,13 @@ async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
+/// ✅ webhook：只做校验/解析/入队，然后立刻 200
 async fn telegram_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(update): Json<TgUpdate>,
 ) -> impl IntoResponse {
+    // 1) 校验 secret token（可选）
     if let Some(expected) = state.secret_token.as_deref() {
         let got = headers
             .get("x-telegram-bot-api-secret-token")
@@ -201,12 +151,14 @@ async fn telegram_webhook(
         }
     }
 
+    // 2) 取 message
     let (msg, edited) = match (update.channel_post, update.edited_channel_post) {
         (Some(m), _) => (m, false),
         (None, Some(m)) => (m, true),
         (None, None) => return (StatusCode::OK, "ignored").into_response(),
     };
 
+    // 3) 提取文本
     let text = msg.text.or(msg.caption).unwrap_or_default();
     if text.trim().is_empty() {
         return (StatusCode::OK, "empty").into_response();
@@ -228,6 +180,7 @@ async fn telegram_webhook(
     let kind = if edited { "edited_post" } else { "new_post" }.to_string();
     let ev = PostEvent { kind, post };
 
+    // 4) 序列化
     let body = match serde_json::to_vec(&ev) {
         Ok(b) => b,
         Err(e) => {
@@ -236,16 +189,94 @@ async fn telegram_webhook(
         }
     };
 
-    // ⚠️ message_id 不要用 post.id（否则你开了 duplicate detection 会吞 edited）
-    // 用 update_id 做唯一 ID
+    // 5) SB message_id：用 update_id 保证唯一（避免 duplicate detection 吞 edited）
     let sb_message_id = format!("{}:u{}", ev.post.id, update.update_id);
 
-    if let Err(e) = state.sb.publish_with_retry(body, sb_message_id).await {
-        warn!("failed to publish to service bus: {:?}", e);
-        return (StatusCode::INTERNAL_SERVER_ERROR, "publish_failed").into_response();
+    // 6) 入队（快）
+    let q = QueuedEvent {
+        body,
+        sb_message_id,
+        update_id: update.update_id,
+        chat_id: ev.post.chat_id,
+        message_id: ev.post.message_id,
+    };
+
+    // 队列满了：返回 503，让 Telegram 重试（避免静默丢）
+    if let Err(_e) = state.tx.try_send(q) {
+        warn!(
+            "queue full, returning 503 for retry (update_id={}, chat_id={}, msg_id={})",
+            update.update_id, ev.post.chat_id, ev.post.message_id
+        );
+        return (StatusCode::SERVICE_UNAVAILABLE, "queue_full").into_response();
     }
 
+    info!(
+        "enqueued update_id={} chat_id={} msg_id={} edited={}",
+        update.update_id, ev.post.chat_id, ev.post.message_id, ev.post.edited
+    );
+
+    // ✅ 立刻返回 200，彻底消灭 Telegram read timeout
     (StatusCode::OK, "ok").into_response()
+}
+
+/// 后台 loop：从队列拿 -> 发到 Service Bus
+async fn publisher_loop(conn: String, topic: String, mut rx: mpsc::Receiver<QueuedEvent>) {
+    info!("publisher_loop started: topic={}", topic);
+
+    while let Some(item) = rx.recv().await {
+        // 对每条消息做“直到成功”的重试，但带上退避，避免打爆
+        let mut attempt: u32 = 0;
+
+        loop {
+            attempt += 1;
+
+            match publish_once(&conn, &topic, item.body.clone(), item.sb_message_id.clone()).await {
+                Ok(_) => {
+                    info!(
+                        "published ok (attempt={} update_id={} chat_id={} msg_id={})",
+                        attempt, item.update_id, item.chat_id, item.message_id
+                    );
+                    break;
+                }
+                Err(e) => {
+                    // 指数退避：100ms -> ... -> 最大 5s
+                    let backoff_ms = (100u64 * (1u64 << (attempt.min(6) - 1))).min(5000);
+                    warn!(
+                        "publish failed (attempt={} backoff={}ms update_id={} msg_id={}): {:?}",
+                        attempt, backoff_ms, item.update_id, item.message_id, e
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    continue;
+                }
+            }
+        }
+    }
+
+    warn!("publisher_loop exited: receiver closed");
+}
+
+/// 每次 publish 都新建 client/sender：无共享状态，最稳
+async fn publish_once(
+    conn: &str,
+    topic: &str,
+    body: Vec<u8>,
+    message_id: String,
+) -> anyhow::Result<()> {
+    let mut client: ServiceBusClient<BasicRetryPolicy> =
+        ServiceBusClient::new_from_connection_string(
+            conn.to_string(),
+            ServiceBusClientOptions::default(),
+        )
+        .await?;
+
+    let mut sender = client
+        .create_sender(topic.to_string(), ServiceBusSenderOptions::default())
+        .await?;
+
+    let mut msg = ServiceBusMessage::new(body);
+    msg.set_message_id(message_id)?;
+    sender.send_message(msg).await?;
+    Ok(())
 }
 
 fn extract_tags(text: &str) -> Vec<String> {
