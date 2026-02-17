@@ -5,7 +5,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use azservicebus::core::BasicRetryPolicy; // ✅ 修复 ServiceBusClient 的泛型
+use azservicebus::core::BasicRetryPolicy;
 use azservicebus::prelude::*;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -23,10 +23,89 @@ struct AppState {
     sb: Arc<SbState>,
 }
 
+/// 把 client + sender 放在同一个锁里，避免死锁 & 允许 create_sender(&mut self)
 struct SbState {
-    // ✅ ServiceBusClient 是泛型：ServiceBusClient<RP>
-    _client: ServiceBusClient<BasicRetryPolicy>,
-    sender: Mutex<ServiceBusSender>,
+    topic: String,
+    inner: Mutex<SbInner>,
+}
+
+struct SbInner {
+    client: ServiceBusClient<BasicRetryPolicy>,
+    sender: Option<ServiceBusSender>,
+}
+
+impl SbState {
+    async fn ensure_sender_locked(inner: &mut SbInner, topic: &str) -> anyhow::Result<()> {
+        if inner.sender.is_none() {
+            let s = inner
+                .client
+                .create_sender(topic.to_string(), ServiceBusSenderOptions::default())
+                .await?;
+            inner.sender = Some(s);
+        }
+        Ok(())
+    }
+
+    /// 发送：失败则重建 sender 并重试一次（重试时重新构造 message，避免 message 不可复用）
+    async fn publish_bytes_with_retry(
+        &self,
+        body: Vec<u8>,
+        message_id: String,
+    ) -> anyhow::Result<()> {
+        // --- first attempt ---
+        {
+            let mut inner = self.inner.lock().await;
+
+            Self::ensure_sender_locked(&mut inner, &self.topic).await?;
+
+            let mut msg1 = ServiceBusMessage::new(body.clone());
+            msg1.set_message_id(message_id.clone())?;
+
+            let send1 = inner
+                .sender
+                .as_mut()
+                .expect("sender exists after ensure_sender")
+                .send_message(msg1)
+                .await;
+
+            if send1.is_ok() {
+                return Ok(());
+            }
+
+            warn!(
+                "service bus send failed (likely idle detach), will rebuild sender then retry: {:?}",
+                send1.err().unwrap()
+            );
+
+            // 标记 sender 失效，释放锁后重建再试
+            inner.sender = None;
+        }
+
+        // --- rebuild + second attempt ---
+        {
+            let mut inner = self.inner.lock().await;
+
+            // 重建 sender
+            let s = inner
+                .client
+                .create_sender(self.topic.clone(), ServiceBusSenderOptions::default())
+                .await?;
+            inner.sender = Some(s);
+
+            // 重试：重新构造 message2
+            let mut msg2 = ServiceBusMessage::new(body);
+            msg2.set_message_id(message_id)?;
+
+            inner
+                .sender
+                .as_mut()
+                .expect("sender exists after rebuild")
+                .send_message(msg2)
+                .await?;
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,7 +158,9 @@ struct TgChat {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
+        .with_env_filter(
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "info,azservicebus=warn".to_string()),
+        )
         .init();
 
     let secret_token = std::env::var("TELEGRAM_WEBHOOK_SECRET").ok();
@@ -88,20 +169,17 @@ async fn main() {
         .expect("missing SERVICEBUS_CONNECTION_STRING");
     let topic = std::env::var("SERVICEBUS_TOPIC").unwrap_or_else(|_| "posts".to_string());
 
-    // ✅ 创建并持有 client + sender（一次性）
-    let mut client: ServiceBusClient<BasicRetryPolicy> =
+    let client: ServiceBusClient<BasicRetryPolicy> =
         ServiceBusClient::new_from_connection_string(conn, ServiceBusClientOptions::default())
             .await
             .expect("failed to create ServiceBusClient");
 
-    let sender = client
-        .create_sender(topic, ServiceBusSenderOptions::default())
-        .await
-        .expect("failed to create ServiceBusSender");
-
     let sb = Arc::new(SbState {
-        _client: client,
-        sender: Mutex::new(sender),
+        topic: topic.clone(),
+        inner: Mutex::new(SbInner {
+            client,
+            sender: None, // lazy create
+        }),
     });
 
     let state = AppState { secret_token, sb };
@@ -134,7 +212,6 @@ async fn telegram_webhook(
     headers: HeaderMap,
     Json(update): Json<TgUpdate>,
 ) -> impl IntoResponse {
-    // 1) 校验 secret token（建议开启）
     if let Some(expected) = state.secret_token.as_deref() {
         let got = headers
             .get("x-telegram-bot-api-secret-token")
@@ -145,23 +222,17 @@ async fn telegram_webhook(
         }
     }
 
-    // 2) 取 message：优先 channel_post，其次 edited_channel_post
     let (msg, edited) = match (update.channel_post, update.edited_channel_post) {
         (Some(m), _) => (m, false),
         (None, Some(m)) => (m, true),
-        (None, None) => {
-            // 不是频道消息，直接 200 避免 Telegram 重试
-            return (StatusCode::OK, "ignored").into_response();
-        }
+        (None, None) => return (StatusCode::OK, "ignored").into_response(),
     };
 
-    // 3) 提取文本（text 或 caption）
     let text = msg.text.or(msg.caption).unwrap_or_default();
     if text.trim().is_empty() {
         return (StatusCode::OK, "empty").into_response();
     }
 
-    // 4) 解析 tags：#tag
     let tags = extract_tags(&text);
 
     let post = Post {
@@ -178,7 +249,6 @@ async fn telegram_webhook(
     let kind = if edited { "edited_post" } else { "new_post" }.to_string();
     let ev = PostEvent { kind, post };
 
-    // 5) publish 到 Service Bus
     let body = match serde_json::to_vec(&ev) {
         Ok(b) => b,
         Err(e) => {
@@ -187,16 +257,12 @@ async fn telegram_webhook(
         }
     };
 
-    let mut sb_msg = ServiceBusMessage::new(body);
-    if let Err(e) = sb_msg.set_message_id(ev.post.id.clone()) {
-        warn!("failed to set message id: {:?}", e);
-        return (StatusCode::INTERNAL_SERVER_ERROR, "set_message_id failed").into_response();
-    } // ✅ 正确设置 message_id
-
-    let mut sender = state.sb.sender.lock().await;
-    if let Err(e) = sender.send_message(sb_msg).await {
+    if let Err(e) = state
+        .sb
+        .publish_bytes_with_retry(body, ev.post.id.clone())
+        .await
+    {
         warn!("failed to publish to service bus: {:?}", e);
-        // 返回 500 让 Telegram 重试（更接近至少一次）
         return (StatusCode::INTERNAL_SERVER_ERROR, "publish_failed").into_response();
     }
 
