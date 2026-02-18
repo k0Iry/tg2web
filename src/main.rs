@@ -33,6 +33,19 @@ struct QueuedEvent {
     message_id: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Media {
+    kind: String, // "photo" | "video" | "document"
+    file_id: String,
+    file_unique_id: Option<String>,
+    mime_type: Option<String>,
+    width: Option<i32>,
+    height: Option<i32>,
+    duration: Option<i32>,
+    file_name: Option<String>,
+    file_size: Option<i64>,
+}
+
 /// --- 业务数据结构（与你现在一致） ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +58,10 @@ struct Post {
     tags: Vec<String>,
     edited: bool,
     received_at: DateTime<Utc>,
+    #[serde(default)]
+    media: Vec<Media>,
+    #[serde(default)]
+    media_group_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +88,64 @@ struct TgMessage {
     text: Option<String>,
     #[serde(default)]
     caption: Option<String>,
+    // ✅ album 多图/多媒体会有
+    #[serde(default)]
+    media_group_id: Option<String>,
+
+    // ✅ photo 是数组：从小到大多张缩略图
+    #[serde(default)]
+    photo: Option<Vec<TgPhotoSize>>,
+
+    #[serde(default)]
+    video: Option<TgVideo>,
+
+    #[serde(default)]
+    document: Option<TgDocument>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgPhotoSize {
+    file_id: String,
+    #[serde(default)]
+    file_unique_id: Option<String>,
+    #[serde(default)]
+    width: Option<i32>,
+    #[serde(default)]
+    height: Option<i32>,
+    #[serde(default)]
+    file_size: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgVideo {
+    file_id: String,
+    #[serde(default)]
+    file_unique_id: Option<String>,
+    #[serde(default)]
+    mime_type: Option<String>,
+    #[serde(default)]
+    width: Option<i32>,
+    #[serde(default)]
+    height: Option<i32>,
+    #[serde(default)]
+    duration: Option<i32>,
+    #[serde(default)]
+    file_name: Option<String>,
+    #[serde(default)]
+    file_size: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgDocument {
+    file_id: String,
+    #[serde(default)]
+    file_unique_id: Option<String>,
+    #[serde(default)]
+    mime_type: Option<String>,
+    #[serde(default)]
+    file_name: Option<String>,
+    #[serde(default)]
+    file_size: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -159,9 +234,12 @@ async fn telegram_webhook(
     };
 
     // 3) 提取文本
+    let media = extract_media(&msg);
     let text = msg.text.or(msg.caption).unwrap_or_default();
-    if text.trim().is_empty() {
-        return (StatusCode::OK, "empty").into_response();
+
+    // ✅ 只有文字和 media 都空，才忽略
+    if text.trim().is_empty() && media.is_empty() {
+        return (StatusCode::OK, "ignored").into_response();
     }
 
     let tags = extract_tags(&text);
@@ -175,6 +253,9 @@ async fn telegram_webhook(
         tags,
         edited,
         received_at: Utc::now(),
+
+        media,
+        media_group_id: msg.media_group_id.clone(),
     };
 
     let kind = if edited { "edited_post" } else { "new_post" }.to_string();
@@ -305,4 +386,55 @@ fn extract_tags(text: &str) -> Vec<String> {
     tags.sort();
     tags.dedup();
     tags
+}
+
+fn extract_media(msg: &TgMessage) -> Vec<Media> {
+    let mut out = Vec::new();
+
+    // photo: 取最大那张（最后一张通常分辨率最大）
+    if let Some(list) = &msg.photo {
+        if let Some(p) = list.last() {
+            out.push(Media {
+                kind: "photo".to_string(),
+                file_id: p.file_id.clone(),
+                file_unique_id: p.file_unique_id.clone(),
+                mime_type: None,
+                width: p.width,
+                height: p.height,
+                duration: None,
+                file_name: None,
+                file_size: p.file_size,
+            });
+        }
+    }
+
+    if let Some(v) = &msg.video {
+        out.push(Media {
+            kind: "video".to_string(),
+            file_id: v.file_id.clone(),
+            file_unique_id: v.file_unique_id.clone(),
+            mime_type: v.mime_type.clone(),
+            width: v.width,
+            height: v.height,
+            duration: v.duration,
+            file_name: v.file_name.clone(),
+            file_size: v.file_size,
+        });
+    }
+
+    if let Some(d) = &msg.document {
+        out.push(Media {
+            kind: "document".to_string(),
+            file_id: d.file_id.clone(),
+            file_unique_id: d.file_unique_id.clone(),
+            mime_type: d.mime_type.clone(),
+            width: None,
+            height: None,
+            duration: None,
+            file_name: d.file_name.clone(),
+            file_size: d.file_size,
+        });
+    }
+
+    out
 }
