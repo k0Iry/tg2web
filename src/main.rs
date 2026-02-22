@@ -19,7 +19,7 @@ use tracing::{info, warn};
 
 #[derive(Clone)]
 struct AppState {
-    secret_token: Option<String>,
+    secret_token: String,
     tx: mpsc::Sender<QueuedEvent>,
 }
 
@@ -158,7 +158,7 @@ struct TgChat {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             std::env::var("RUST_LOG")
@@ -166,7 +166,7 @@ async fn main() {
         )
         .init();
 
-    let secret_token = std::env::var("TELEGRAM_WEBHOOK_SECRET").ok();
+    let secret_token = std::env::var("TELEGRAM_WEBHOOK_SECRET")?;
     let conn = std::env::var("SERVICEBUS_CONNECTION_STRING")
         .expect("missing SERVICEBUS_CONNECTION_STRING");
     let topic = std::env::var("SERVICEBUS_TOPIC").unwrap_or_else(|_| "posts".to_string());
@@ -203,6 +203,7 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+    Ok(())
 }
 
 async fn healthz() -> impl IntoResponse {
@@ -215,15 +216,13 @@ async fn telegram_webhook(
     headers: HeaderMap,
     Json(update): Json<TgUpdate>,
 ) -> impl IntoResponse {
-    // 1) 校验 secret token（可选）
-    if let Some(expected) = state.secret_token.as_deref() {
-        let got = headers
-            .get("x-telegram-bot-api-secret-token")
-            .and_then(|v| v.to_str().ok());
-        if got != Some(expected) {
-            warn!("webhook rejected: secret token mismatch");
-            return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-        }
+    // 1) 校验 secret token
+    if !headers
+        .get("x-telegram-bot-api-secret-token")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|token| token == state.secret_token)
+    {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
 
     // 2) 取 message
