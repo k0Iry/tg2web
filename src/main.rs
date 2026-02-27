@@ -217,10 +217,10 @@ async fn telegram_webhook(
     Json(update): Json<TgUpdate>,
 ) -> impl IntoResponse {
     // 1) 校验 secret token
-    if !headers
+    if headers
         .get("x-telegram-bot-api-secret-token")
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|token| token == state.secret_token)
+        .is_none_or(|token| token != state.secret_token)
     {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
