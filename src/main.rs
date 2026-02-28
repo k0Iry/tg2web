@@ -8,7 +8,7 @@ use axum::{
 use azservicebus::core::BasicRetryPolicy;
 use azservicebus::prelude::*;
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{de::Deserializer, Deserialize, Serialize};
 use std::{net::SocketAddr, time::Duration};
 use tokio::sync::mpsc;
 use tower_http::{
@@ -62,6 +62,8 @@ struct Post {
     media: Vec<Media>,
     #[serde(default)]
     media_group_id: Option<String>,
+    #[serde(default)]
+    reply: Option<TgReplyMessage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +103,58 @@ struct TgMessage {
 
     #[serde(default)]
     document: Option<TgDocument>,
+
+    #[serde(default)]
+    reply_to_message: Option<TgReplyMessage>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TgReplyMessage {
+    message_id: i64,
+    text: Option<String>,
+    caption: Option<String>,
+    media_kind: Option<String>, // "photo" | "video" | "document"
+}
+
+// 自定义反序列化：根据实际媒体推断 kind，避免携带完整媒体体积
+impl<'de> Deserialize<'de> for TgReplyMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawReply {
+            message_id: i64,
+            #[serde(default)]
+            text: Option<String>,
+            #[serde(default)]
+            caption: Option<String>,
+            #[serde(default)]
+            photo: Option<Vec<TgPhotoSize>>,
+            #[serde(default)]
+            video: Option<TgVideo>,
+            #[serde(default)]
+            document: Option<TgDocument>,
+        }
+
+        let raw = RawReply::deserialize(deserializer)?;
+        let media_kind = if raw.photo.as_ref().is_some_and(|v| !v.is_empty()) {
+            Some("photo".to_string())
+        } else if raw.video.is_some() {
+            Some("video".to_string())
+        } else if raw.document.is_some() {
+            Some("document".to_string())
+        } else {
+            None
+        };
+
+        Ok(TgReplyMessage {
+            message_id: raw.message_id,
+            text: raw.text,
+            caption: raw.caption,
+            media_kind,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -255,6 +309,7 @@ async fn telegram_webhook(
 
         media,
         media_group_id: msg.media_group_id.clone(),
+        reply: msg.reply_to_message.clone(),
     };
 
     let kind = if edited { "edited_post" } else { "new_post" }.to_string();
