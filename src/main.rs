@@ -11,10 +11,6 @@ use chrono::{DateTime, Utc};
 use serde::{de::Deserializer, Deserialize, Serialize};
 use std::{net::SocketAddr, time::Duration};
 use tokio::sync::mpsc;
-use tower_http::{
-    cors::{Any, CorsLayer},
-    trace::TraceLayer,
-};
 use tracing::{info, warn};
 
 #[derive(Clone)]
@@ -215,8 +211,7 @@ struct TgChat {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            std::env::var("RUST_LOG")
-                .unwrap_or_else(|_| "info,azservicebus=warn,tower_http=info".to_string()),
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "info,azservicebus=warn".to_string()),
         )
         .init();
 
@@ -243,13 +238,6 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/telegram/webhook", post(telegram_webhook))
-        .layer(TraceLayer::new_for_http())
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 80));
