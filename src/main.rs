@@ -60,6 +60,8 @@ struct Post {
     media_group_id: Option<String>,
     #[serde(default)]
     reply: Option<TgReplyMessage>,
+    #[serde(default)]
+    entities: Option<Vec<MessageEntity>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +77,20 @@ struct TgUpdate {
     channel_post: Option<TgMessage>,
     #[serde(default)]
     edited_channel_post: Option<TgMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageEntity {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub offset: i32,
+    pub length: i32,
+
+    #[serde(default)]
+    pub url: Option<String>,
+
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +118,11 @@ struct TgMessage {
 
     #[serde(default)]
     reply_to_message: Option<TgReplyMessage>,
+
+    #[serde(default)]
+    entities: Option<Vec<MessageEntity>>,
+    #[serde(default)]
+    caption_entities: Option<Vec<MessageEntity>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -276,7 +297,11 @@ async fn telegram_webhook(
 
     // 3) 提取文本
     let media = extract_media(&msg);
-    let text = msg.text.or(msg.caption).unwrap_or_default();
+    let (text, entities) = match (msg.text, msg.caption) {
+        (Some(text), _) => (text, msg.entities),
+        (None, Some(caption)) => (caption, msg.caption_entities),
+        (None, None) => (String::new(), None),
+    };
 
     // ✅ 只有文字和 media 都空，才忽略
     if text.trim().is_empty() && media.is_empty() {
@@ -296,8 +321,9 @@ async fn telegram_webhook(
         received_at: Utc::now(),
 
         media,
-        media_group_id: msg.media_group_id.clone(),
-        reply: msg.reply_to_message.clone(),
+        media_group_id: msg.media_group_id,
+        reply: msg.reply_to_message,
+        entities,
     };
 
     let kind = if edited { "edited_post" } else { "new_post" }.to_string();
