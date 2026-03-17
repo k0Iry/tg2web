@@ -189,22 +189,18 @@ struct TgPhotoSize {
 #[derive(Debug, Deserialize)]
 struct TgVideo {
     file_id: String,
-    #[serde(default)]
-    file_unique_id: Option<String>,
+    file_unique_id: String,
     #[serde(default)]
     mime_type: Option<String>,
-    #[serde(default)]
-    width: Option<i32>,
-    #[serde(default)]
-    height: Option<i32>,
-    #[serde(default)]
-    duration: Option<i32>,
+    width: i32,
+    height: i32,
+    duration: i32,
     #[serde(default)]
     file_name: Option<String>,
     #[serde(default)]
     file_size: Option<i64>,
-    #[serde(default, alias = "thumbnail")]
-    thumb: Option<TgPhotoSize>,
+    #[serde(default)]
+    thumbnail: Option<TgPhotoSize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -292,7 +288,11 @@ async fn telegram_webhook(
     let update = match payload {
         Ok(Json(update)) => update,
         Err(err) => {
-            warn!("invalid telegram payload: status={} error={}", err.status(), err.body_text());
+            warn!(
+                "invalid telegram payload: status={} error={}",
+                err.status(),
+                err.body_text()
+            );
             return (StatusCode::BAD_REQUEST, "invalid_payload").into_response();
         }
     };
@@ -490,14 +490,14 @@ fn extract_media(msg: &TgMessage) -> Vec<Media> {
         out.push(Media {
             kind: "video".to_string(),
             file_id: v.file_id.clone(),
-            file_unique_id: v.file_unique_id.clone(),
+            file_unique_id: Some(v.file_unique_id.clone()),
             mime_type: v.mime_type.clone(),
-            width: v.width,
-            height: v.height,
-            duration: v.duration,
+            width: Some(v.width),
+            height: Some(v.height),
+            duration: Some(v.duration),
             file_name: v.file_name.clone(),
             file_size: v.file_size,
-            thumbnail: v.thumb.clone(),
+            thumbnail: v.thumbnail.clone(),
         });
     }
 
