@@ -40,6 +40,7 @@ struct Media {
     duration: Option<i32>,
     file_name: Option<String>,
     file_size: Option<i64>,
+    thumbnail: Option<TgPhotoSize>,
 }
 
 /// --- 业务数据结构（与你现在一致） ---
@@ -174,15 +175,12 @@ impl<'de> Deserialize<'de> for TgReplyMessage {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TgPhotoSize {
     file_id: String,
-    #[serde(default)]
-    file_unique_id: Option<String>,
-    #[serde(default)]
-    width: Option<i32>,
-    #[serde(default)]
-    height: Option<i32>,
+    file_unique_id: String,
+    width: i32,
+    height: i32,
     #[serde(default)]
     file_size: Option<i64>,
 }
@@ -204,6 +202,8 @@ struct TgVideo {
     file_name: Option<String>,
     #[serde(default)]
     file_size: Option<i64>,
+    #[serde(default, alias = "thumbnail")]
+    thumb: Option<TgPhotoSize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -465,13 +465,14 @@ fn extract_media(msg: &TgMessage) -> Vec<Media> {
             out.push(Media {
                 kind: "photo".to_string(),
                 file_id: p.file_id.clone(),
-                file_unique_id: p.file_unique_id.clone(),
+                file_unique_id: Some(p.file_unique_id.clone()),
                 mime_type: None,
-                width: p.width,
-                height: p.height,
+                width: Some(p.width),
+                height: Some(p.height),
                 duration: None,
                 file_name: None,
                 file_size: p.file_size,
+                thumbnail: None,
             });
         }
     }
@@ -487,6 +488,7 @@ fn extract_media(msg: &TgMessage) -> Vec<Media> {
             duration: v.duration,
             file_name: v.file_name.clone(),
             file_size: v.file_size,
+            thumbnail: v.thumb.clone(),
         });
     }
 
@@ -501,6 +503,7 @@ fn extract_media(msg: &TgMessage) -> Vec<Media> {
             duration: None,
             file_name: d.file_name.clone(),
             file_size: d.file_size,
+            thumbnail: None,
         });
     }
 
