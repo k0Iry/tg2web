@@ -1,4 +1,5 @@
 use axum::{
+    extract::rejection::JsonRejection,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
@@ -277,7 +278,7 @@ async fn healthz() -> impl IntoResponse {
 async fn telegram_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(update): Json<TgUpdate>,
+    payload: Result<Json<TgUpdate>, JsonRejection>,
 ) -> impl IntoResponse {
     // 1) 校验 secret token
     if headers
@@ -287,6 +288,14 @@ async fn telegram_webhook(
     {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
+
+    let update = match payload {
+        Ok(Json(update)) => update,
+        Err(err) => {
+            warn!("invalid telegram payload: status={} error={}", err.status(), err.body_text());
+            return (StatusCode::BAD_REQUEST, "invalid_payload").into_response();
+        }
+    };
 
     // 2) 取 message
     let (msg, edited) = match (update.channel_post, update.edited_channel_post) {
